@@ -1,0 +1,38 @@
+name: Проверка каналов
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+  push:
+    paths:
+      - 'maestro_tv.js'
+      - 'scripts/**'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: check
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node scripts/check.mjs
+      - name: Commit
+        run: |
+          git config user.name "maestro-tv-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add data
+          git diff --cached --quiet && exit 0
+          git commit -m "Обновление списка каналов"
+          git pull --rebase origin main
+          git push
+          curl -s "https://purge.jsdelivr.net/gh/${{ github.repository }}@main/maestro_tv.js" > /dev/null || true
