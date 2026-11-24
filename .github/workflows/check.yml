@@ -26,6 +26,12 @@ jobs:
         with:
           node-version: 22
       - run: node scripts/check.mjs
+      - name: Телепрограмма
+        run: node scripts/epg.mjs
+        continue-on-error: true
+      - name: Радио
+        run: node scripts/radio.mjs
+        continue-on-error: true
       - name: Commit
         run: |
           git config user.name "maestro-tv-bot"

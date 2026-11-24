@@ -146,10 +146,11 @@ async function main() {
     let c = byKey.get(key);
     if (!c) {
       const cat = categorize(ch);
-      c = { n: ch.name, l: ch.logo, c: ch.lang === 'w' ? WORLD_CAT[cat] || 'w_fun' : cat, w: ch.lang === 'w' ? 1 : 0, src: [] };
+      c = { n: ch.name, l: ch.logo, c: ch.lang === 'w' ? WORLD_CAT[cat] || 'w_fun' : cat, w: ch.lang === 'w' ? 1 : 0, ids: [], src: [] };
       byKey.set(key, c);
     }
     if (!c.l && ch.logo) c.l = ch.logo;
+    if (ch.id && !c.ids.includes(ch.id)) c.ids.push(ch.id);
     c.src.push(item);
   }
 
@@ -157,7 +158,7 @@ async function main() {
   const channels = [...byKey.values()].map((c) => {
     c.src.sort((a, b) => rank[a.s] - rank[b.s] || b.hd - a.hd || a.ms - b.ms);
     return {
-      n: c.n, l: c.l || '', c: c.c, ...(c.w ? { w: 1 } : {}),
+      n: c.n, l: c.l || '', c: c.c, ...(c.w ? { w: 1 } : {}), i: c.ids,
       s: c.src[0].s, hd: c.src.some((x) => x.hd && x.s === 'ok') ? 1 : c.src[0].hd,
       u: c.src.map((x) => x.u),
     };
