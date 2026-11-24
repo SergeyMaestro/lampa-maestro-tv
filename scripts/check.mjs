@@ -25,8 +25,9 @@ const WORLD_SKIP = ['religious', 'legislative', 'shop'];
 const WORLD_CAT = { docs: 'w_docs', travel: 'w_docs', movies: 'w_movies', news: 'w_news', sport: 'w_sport', music: 'w_music', kids: 'w_kids', fun: 'w_fun', other: 'w_fun', adult: 'adult' };
 
 const UA = 'Mozilla/5.0 (Web0S; Linux/SmartTV) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0 Safari/537.36';
-const TIMEOUT = 9000;
-const CONCURRENCY = 96;
+let TIMEOUT = 9000;
+const CONCURRENCY = 48;
+const PER_HOST = 4;
 
 async function get(url, opts = {}) {
   const ctrl = new AbortController();
@@ -38,7 +39,7 @@ async function get(url, opts = {}) {
       headers: { 'User-Agent': UA, ...(opts.headers || {}) },
     });
     let body = '';
-    if (opts.text) body = (await res.text()).slice(0, 200000);
+    if (opts.text) body = opts.full ? await res.text() : (await res.text()).slice(0, 200000);
     else if (opts.peek) {
       const reader = res.body?.getReader();
       if (reader) { await reader.read(); reader.cancel().catch(() => {}); }
@@ -84,10 +85,20 @@ async function checkStream(url) {
   return { s: 'ok', ms: Date.now() - t0 };
 }
 
+// не больше PER_HOST одновременных запросов на один сервер, иначе он начинает отказывать
+const hostBusy = new Map();
+const hostOf = (u) => { try { return new URL(u).host; } catch { return u; } };
+async function withHost(url, fn) {
+  const h = hostOf(url);
+  while ((hostBusy.get(h) || 0) >= PER_HOST) await new Promise((r) => setTimeout(r, 50));
+  hostBusy.set(h, (hostBusy.get(h) || 0) + 1);
+  try { return await fn(); } finally { hostBusy.set(h, hostBusy.get(h) - 1); }
+}
+
 async function pool(items, n, fn) {
   let i = 0;
   const workers = Array.from({ length: n }, async () => {
-    while (i < items.length) { const k = i++; items[k].res = await fn(items[k]); }
+    while (i < items.length) { const k = i++; items[k].res = await withHost(items[k].url, () => fn(items[k])); }
   });
   await Promise.all(workers);
 }
@@ -95,7 +106,9 @@ async function pool(items, n, fn) {
 async function main() {
   const all = [];
   for (const src of SOURCES) {
-    const r = await get(src.url, { text: true });
+    TIMEOUT = 60000;
+    const r = await get(src.url, { text: true, full: true });
+    TIMEOUT = 9000;
     if (!r.ok) { console.log('source fail', src.p, r.status); continue; }
     let list = parseM3U(r.body).map((ch) => ({ ...ch, lang: src.lang }));
     if (src.lang === 'w') {
@@ -117,6 +130,12 @@ async function main() {
   console.log('unique streams', streams.length);
 
   await pool(streams, CONCURRENCY, (ch) => checkStream(ch.url));
+
+  // второй заход: кто не ответил (таймаут/сеть/5xx), проверяем медленно и с большим таймаутом
+  const retry = streams.filter((x) => x.res.s === 'dead' && (x.res.code === 0 || x.res.code >= 500));
+  console.log('retry', retry.length);
+  TIMEOUT = 15000;
+  await pool(retry, 16, (ch) => checkStream(ch.url));
 
   // склеиваем зеркала одного канала
   const byKey = new Map();
