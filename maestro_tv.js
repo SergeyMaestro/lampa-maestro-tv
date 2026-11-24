@@ -10,7 +10,7 @@
     if (window.maestro_tv_loaded) return;
     window.maestro_tv_loaded = true;
 
-    var VERSION = '2.0.0';
+    var VERSION = '2.1.0';
     var PLUGIN = 'maestro_tv';
     var REPO = 'SergeyMaestro/lampa-maestro-tv';
     var DATA_URLS = [
@@ -74,6 +74,17 @@
         }
         return 'other';
     }
+
+    var WORLD = [
+        { id: 'w_news', title: 'Новости', icon: '📰' },
+        { id: 'w_docs', title: 'Познавательное', icon: '🌍' },
+        { id: 'w_movies', title: 'Кино и сериалы', icon: '🎬' },
+        { id: 'w_sport', title: 'Спорт', icon: '⚽' },
+        { id: 'w_music', title: 'Музыка', icon: '🎵' },
+        { id: 'w_kids', title: 'Мультики', icon: '🧸' },
+        { id: 'w_fun', title: 'Разное', icon: '🎉' }
+    ];
+    var PAGE = 40;
 
     var STATE = { data: null, time: 0 };
 
@@ -158,7 +169,7 @@
 
     function fromJSON(json) {
         return json.channels.map(function (c) {
-            return { name: c.n, logo: c.l, cat: c.c, hd: !!c.hd, status: c.s, urls: c.u, key: cleanKey(c.n) };
+            return { name: c.n, logo: c.l, cat: c.c, hd: !!c.hd, status: c.s, urls: c.u, world: !!c.w, key: (c.w ? 'w:' : '') + cleanKey(c.n) };
         });
     }
 
@@ -212,11 +223,12 @@
     }
 
     function visible(list) {
-        var adult = field('mtv_adult', false), hdOnly = field('mtv_hd_only', false), geo = field('mtv_geo', false);
+        var adult = field('mtv_adult', false), hdOnly = field('mtv_hd_only', false), geo = field('mtv_geo', false), world = field('mtv_world', true);
         var hidden = getJSON('mtv_hidden', []);
         var bad = getJSON('mtv_bad', {});
         return list.filter(function (c) {
             if (!adult && c.cat === 'adult') return false;
+            if (!world && c.world) return false;
             if (hdOnly && !c.hd) return false;
             if (!geo && c.status === 'geo') return false;
             if (hidden.indexOf(c.key) !== -1) return false;
@@ -234,7 +246,7 @@
 
     // ---------- избранное, недавние, скрытые ----------
 
-    function slim(c) { return { name: c.name, logo: c.logo, cat: c.cat, hd: c.hd, status: c.status, urls: c.urls, key: c.key }; }
+    function slim(c) { return { name: c.name, logo: c.logo, cat: c.cat, hd: c.hd, status: c.status, urls: c.urls, world: c.world, key: c.key }; }
     function isFav(c) { return getJSON('mtv_fav2', []).some(function (f) { return f.key === c.key; }); }
     function toggleFav(c) {
         var fav = getJSON('mtv_fav2', []), had = isFav(c);
@@ -330,6 +342,7 @@
             '.mtv-row.focus{background:#fff;color:#111;transform:scale(1.015)}' +
             '.mtv-row.focus .mtv-tag{background:rgba(0,0,0,.1)}' +
             '.mtv-row.focus .mtv-tag--hd{background:linear-gradient(135deg,#7c5cff,#2fb6ff);color:#fff}' +
+            '.mtv-sep{opacity:.5;font-size:.85em;font-weight:700;letter-spacing:.08em;text-transform:uppercase;padding:1.2em 1em .5em}' +
             '.mtv-empty{opacity:.5;padding:2em .3em;font-size:1.1em}' +
             '.mtv-foot{opacity:.35;font-size:.85em;padding:1em .3em}';
         var st = document.createElement('style');
@@ -345,7 +358,7 @@
         var side = $('<div class="mtv-side"><div class="mtv-side__in"></div></div>');
         var main = $('<div class="mtv-main"><div class="mtv-main__in"></div></div>');
         var sideIn = side.find('.mtv-side__in'), mainIn = main.find('.mtv-main__in');
-        var data = null, cats = [], current = null, currentEl = null, lastRow = null, zone = 'side', rows = [];
+        var data = null, cats = [], current = null, currentEl = null, lastRow = null, zone = 'side', rows = [], curList = [], shown = 0;
         var switchTimer = null;
 
         html.append(side).append(main);
@@ -377,7 +390,7 @@
             var vis = visible(data.list);
             if (id === 'fav') return getJSON('mtv_fav2', []).length;
             if (id === 'recent') return getJSON('mtv_recent2', []).length;
-            if (id === 'all') return vis.length;
+            if (id === 'all') return vis.filter(function (c) { return !c.world; }).length;
             return vis.filter(function (c) { return c.cat === id; }).length;
         };
 
@@ -385,7 +398,7 @@
             if (id === 'fav') return getJSON('mtv_fav2', []);
             if (id === 'recent') return getJSON('mtv_recent2', []);
             var vis = visible(data.list);
-            return sortList(id === 'all' ? vis : vis.filter(function (c) { return c.cat === id; }));
+            return sortList(id === 'all' ? vis.filter(function (c) { return !c.world; }) : vis.filter(function (c) { return c.cat === id; }));
         };
 
         this.build = function () {
@@ -394,13 +407,18 @@
             cats.push({ id: 'recent', title: 'Недавние', icon: '🕘' });
             CATEGORIES.forEach(function (c) { cats.push({ id: c.id, title: c.title, icon: c.icon }); });
             cats.push({ id: 'all', title: 'Все каналы', icon: '📡' });
+            cats.push({ sep: 'Зарубежные · English' });
+            WORLD.forEach(function (c) { cats.push({ id: c.id, title: c.title, icon: c.icon, world: true }); });
 
             var saved = Lampa.Storage.get('mtv_last_cat', 'docs');
             var first = null;
 
+            var pendingSep = null;
             cats.forEach(function (c) {
+                if (c.sep) { pendingSep = c.sep; return; }
                 var n = self.countFor(c.id);
                 if (!n && c.id !== 'fav') return;
+                if (pendingSep && c.world) { sideIn.append('<div class="mtv-sep">🌐 ' + esc(pendingSep) + '</div>'); pendingSep = null; }
                 var el = $('<div class="mtv-cat selector"><div class="mtv-cat__ico">' + c.icon + '</div>' +
                     '<div class="mtv-cat__name">' + esc(c.title) + '</div><div class="mtv-cat__cnt">' + n + '</div></div>');
                 el.on('hover:focus', function () {
@@ -446,7 +464,19 @@
                 mainIn.append('<div class="mtv-empty">' + (c.id === 'fav' ? 'Долгое нажатие OK на канале → «В избранное»' : 'Пусто') + '</div>');
             }
 
-            list.forEach(function (ch) {
+            shown = 0;
+            curList = list;
+            this.addRows();
+
+            if (Lampa.Activity.active() && Lampa.Activity.active().activity === this.activity) {
+                Lampa.Controller.collectionSet(html);
+            }
+        };
+
+        this.addRows = function () {
+            var list = curList, end = Math.min(shown + PAGE, list.length);
+            list.slice(shown, end).forEach(function (ch, j) {
+                var index = shown + j;
                 var letter = esc((ch.name || '?').charAt(0).toUpperCase());
                 var row = $('<div class="mtv-row selector">' +
                     '<div class="mtv-row__logo">' + (ch.logo ? '<img src="' + esc(ch.logo) + '">' : '<div class="mtv-row__letter">' + letter + '</div>') + '</div>' +
@@ -458,16 +488,16 @@
                     '<div class="mtv-dot' + (ch.status === 'geo' ? ' mtv-dot--geo' : ch.status === 'user' ? ' mtv-dot--user' : '') + '"></div>' +
                     '</div></div>');
                 row.find('img').on('error', function () { $(this).replaceWith('<div class="mtv-row__letter">' + letter + '</div>'); });
-                row.on('hover:focus', function () { zone = 'main'; lastRow = row[0]; follow(main, mainIn, row); });
+                row.on('hover:focus', function () {
+                    zone = 'main'; lastRow = row[0]; follow(main, mainIn, row);
+                    if (index >= shown - 8 && shown < curList.length) { self.addRows(); Lampa.Controller.collectionSet(html); Lampa.Controller.collectionFocus(row[0], html); }
+                });
                 row.on('hover:enter', function () { play(ch, list); });
                 row.on('hover:long', function () { self.menu(ch); });
                 rows.push(row[0]);
                 mainIn.append(row);
             });
-
-            if (Lampa.Activity.active() && Lampa.Activity.active().activity === this.activity) {
-                Lampa.Controller.collectionSet(html);
-            }
+            shown = end;
         };
 
         this.menu = function (ch) {
@@ -553,6 +583,7 @@
             onChange: function () { STATE.data = null; }
         });
         [
+            ['mtv_world', 'Зарубежные каналы (English)', true, ''],
             ['mtv_hd_only', 'Только HD', false, ''],
             ['mtv_geo', 'Показывать каналы с региональной блокировкой', false, 'Жёлтая точка: у робота поток закрыт по региону, у тебя может работать'],
             ['mtv_adult', 'Показывать 18+', false, '']

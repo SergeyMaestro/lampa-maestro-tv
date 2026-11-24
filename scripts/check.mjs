@@ -11,28 +11,22 @@ require('../maestro_tv.js');
 const { parseM3U, categorize, cleanKey } = globalThis.window.MaestroTV;
 
 const BASE = 'https://iptv-org.github.io/iptv/';
+// lang: ru — русскоязычные разделы, w — раздел «Зарубежные»
 const SOURCES = [
-  'languages/rus.m3u',
-  'languages/kaz.m3u',
-  'countries/ru.m3u',
-  'countries/kz.m3u',
-  'countries/by.m3u',
-  'countries/kg.m3u',
-  'countries/uz.m3u',
-  'countries/am.m3u',
-  'countries/ge.m3u',
-  'countries/az.m3u',
-  'countries/md.m3u',
-  'countries/lv.m3u',
-  'countries/ee.m3u',
-  'countries/lt.m3u',
-  'countries/il.m3u',
-  'countries/ua.m3u',
-].map((p) => BASE + p);
+  { p: 'languages/rus.m3u', lang: 'ru' },
+  { p: 'languages/kaz.m3u', lang: 'ru' },
+  { p: 'countries/kz.m3u', lang: 'ru' },
+  { p: 'countries/by.m3u', lang: 'ru' },
+  { p: 'languages/eng.m3u', lang: 'w' },
+].map((x) => ({ ...x, url: BASE + x.p }));
+
+// в зарубежном разделе это не нужно
+const WORLD_SKIP = ['religious', 'legislative', 'shop'];
+const WORLD_CAT = { docs: 'w_docs', travel: 'w_docs', movies: 'w_movies', news: 'w_news', sport: 'w_sport', music: 'w_music', kids: 'w_kids', fun: 'w_fun', other: 'w_fun', adult: 'adult' };
 
 const UA = 'Mozilla/5.0 (Web0S; Linux/SmartTV) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0 Safari/537.36';
 const TIMEOUT = 9000;
-const CONCURRENCY = 48;
+const CONCURRENCY = 96;
 
 async function get(url, opts = {}) {
   const ctrl = new AbortController();
@@ -101,16 +95,24 @@ async function pool(items, n, fn) {
 async function main() {
   const all = [];
   for (const src of SOURCES) {
-    const r = await get(src, { text: true });
-    if (!r.ok) { console.log('source fail', src, r.status); continue; }
-    const list = parseM3U(r.body);
-    console.log(src, list.length);
+    const r = await get(src.url, { text: true });
+    if (!r.ok) { console.log('source fail', src.p, r.status); continue; }
+    let list = parseM3U(r.body).map((ch) => ({ ...ch, lang: src.lang }));
+    if (src.lang === 'w') {
+      list = list.filter((ch) => !String(ch.group).toLowerCase().split(';').some((g) => WORLD_SKIP.includes(g.trim())));
+    }
+    console.log(src.p, list.length);
     all.push(...list);
   }
 
   // уникальные URL; потоки, которым нужны спец-заголовки, Лампа не сыграет
   const byUrl = new Map();
-  for (const ch of all) if (!ch.needsHeaders && !byUrl.has(ch.url)) byUrl.set(ch.url, ch);
+  for (const ch of all) {
+    if (ch.needsHeaders) continue;
+    const prev = byUrl.get(ch.url);
+    if (!prev) byUrl.set(ch.url, ch);
+    else if (prev.lang === 'w' && ch.lang === 'ru') byUrl.set(ch.url, ch); // русская версия важнее
+  }
   const streams = [...byUrl.values()];
   console.log('unique streams', streams.length);
 
@@ -120,11 +122,12 @@ async function main() {
   const byKey = new Map();
   for (const ch of streams) {
     if (ch.res.s === 'dead') continue;
-    const key = cleanKey(ch.name);
+    const key = ch.lang + ':' + cleanKey(ch.name);
     const item = { u: ch.url, s: ch.res.s, hd: ch.hd ? 1 : 0, ms: ch.res.ms || 99999 };
     let c = byKey.get(key);
     if (!c) {
-      c = { n: ch.name, l: ch.logo, c: categorize(ch), g: ch.group, src: [] };
+      const cat = categorize(ch);
+      c = { n: ch.name, l: ch.logo, c: ch.lang === 'w' ? WORLD_CAT[cat] || 'w_fun' : cat, w: ch.lang === 'w' ? 1 : 0, src: [] };
       byKey.set(key, c);
     }
     if (!c.l && ch.logo) c.l = ch.logo;
@@ -135,7 +138,7 @@ async function main() {
   const channels = [...byKey.values()].map((c) => {
     c.src.sort((a, b) => rank[a.s] - rank[b.s] || b.hd - a.hd || a.ms - b.ms);
     return {
-      n: c.n, l: c.l || '', c: c.c,
+      n: c.n, l: c.l || '', c: c.c, ...(c.w ? { w: 1 } : {}),
       s: c.src[0].s, hd: c.src.some((x) => x.hd && x.s === 'ok') ? 1 : c.src[0].hd,
       u: c.src.map((x) => x.u),
     };
