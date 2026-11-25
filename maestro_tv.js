@@ -10,7 +10,7 @@
     if (window.maestro_tv_loaded) return;
     window.maestro_tv_loaded = true;
 
-    var VERSION = '3.0.0';
+    var VERSION = '3.1.0';
     var PLUGIN = 'maestro_tv';
     var REPO = 'SergeyMaestro/lampa-maestro-tv';
     var BASES = [
@@ -98,7 +98,8 @@
         { id: 'r_talk', title: 'Новости и разговор', icon: '🗞' }
     ];
 
-    var STATE = { data: null, time: 0, radio: null, unlocked: false, query: '' };
+    var STATE = { data: null, time: 0, radio: null, unlocked: false, query: '', vis: null, cats: {} };
+    function resetCache() { STATE.vis = null; STATE.cats = {}; }
     var EPG = { ru: null, w: null, wait: {} };
 
     // ---------- утилиты ----------
@@ -210,7 +211,7 @@
 
     function fromJSON(json) {
         return json.channels.map(function (c) {
-            return { name: c.n, logo: c.l, cat: c.c, hd: !!c.hd, status: c.s, urls: c.u, world: !!c.w, key: (c.w ? 'w:' : '') + cleanKey(c.n) };
+            return { name: c.n, sn: c.n.toLowerCase(), logo: c.l, cat: c.c, hd: !!c.hd, status: c.s, urls: c.u, world: !!c.w, key: (c.w ? 'w:' : '') + cleanKey(c.n) };
         });
     }
 
@@ -220,6 +221,7 @@
             var list = fromJSON(json);
             loadUser(function (extra) {
                 STATE.data = { updated: json.updated, stats: json.stats, list: merge(list, extra) };
+                resetCache();
                 STATE.time = Date.now();
                 loadFile('radio.json', function (r) { STATE.radio = r.cats; ok(STATE.data); }, function () { STATE.radio = {}; ok(STATE.data); });
             });
@@ -300,10 +302,12 @@
     function sortList(list) {
         var rank = { ok: 0, user: 1, geo: 2 };
         var stats = getJSON('mtv_stats', {});
+        // без localeCompare: на телевизорах он очень медленный
         return list.slice().sort(function (a, b) {
+            var an = a.sn || (a.sn = String(a.name).toLowerCase()), bn = b.sn || (b.sn = String(b.name).toLowerCase());
             return (rank[a.status] || 0) - (rank[b.status] || 0) ||
                 ((stats[b.key] || 0) - (stats[a.key] || 0)) ||
-                (b.hd - a.hd) || a.name.localeCompare(b.name, 'ru');
+                (b.hd - a.hd) || (an < bn ? -1 : an > bn ? 1 : 0);
         });
     }
 
@@ -325,11 +329,13 @@
         var stats = getJSON('mtv_stats', {});
         stats[c.key] = (stats[c.key] || 0) + 1;
         setJSON('mtv_stats', stats);
+        STATE.cats = {};
     }
     function hide(c) {
         var h = getJSON('mtv_hidden', []);
         if (h.indexOf(c.key) === -1) h.push(c.key);
         setJSON('mtv_hidden', h);
+        resetCache();
         noty('Скрыто. Вернуть: Настройки → Maestro TV');
     }
 
@@ -342,6 +348,77 @@
             else { noty('Неверный PIN'); Lampa.Controller.toggle('content'); }
         });
     }
+
+    // ---------- радиоплеер ----------
+    // Играет прямо в плагине через <audio>: можно листать список, пока играет станция.
+    var RADIO_PLAYER = {
+        audio: null, bar: null, station: null, timer: null,
+        ensure: function () {
+            if (!this.audio) {
+                var a = this.audio = document.createElement('audio');
+                a.preload = 'none';
+                var me = this;
+                a.addEventListener('playing', function () { me.state('live'); });
+                a.addEventListener('waiting', function () { me.state('load'); });
+                a.addEventListener('pause', function () { if (me.station) me.state('pause'); });
+                a.addEventListener('error', function () { me.fail(); });
+            }
+            if (!this.bar) {
+                this.bar = $('<div class="mtv-radio"><div class="mtv-radio__logo"></div>' +
+                    '<div class="mtv-radio__info"><div class="mtv-radio__name"></div><div class="mtv-radio__state"></div></div>' +
+                    '<div class="mtv-eq"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div></div>');
+            }
+            return this;
+        },
+        mount: function (html) { this.ensure(); html.append(this.bar); this.render(); },
+        play: function (st) {
+            this.ensure();
+            if (this.station && this.station.key === st.key) return this.toggle();
+            this.station = st;
+            pushRecent(st);
+            this.audio.src = st.urls[0];
+            this.state('load');
+            var p = this.audio.play();
+            if (p && p.catch) p.catch(function () {});
+            var me = this;
+            clearTimeout(this.timer);
+            this.timer = setTimeout(function () { if (me.audio.paused || me.audio.readyState < 2) me.fail(); }, 15000);
+            this.render();
+        },
+        toggle: function () {
+            if (!this.station) return;
+            if (this.audio.paused) { var p = this.audio.play(); if (p && p.catch) p.catch(function () {}); this.state('load'); }
+            else this.audio.pause();
+        },
+        stop: function () {
+            clearTimeout(this.timer);
+            if (this.audio) { try { this.audio.pause(); } catch (e) {} this.audio.removeAttribute('src'); try { this.audio.load(); } catch (e) {} }
+            this.station = null;
+            this.render();
+        },
+        fail: function () {
+            if (!this.station) return;
+            var name = this.station.name;
+            this.stop();
+            noty('Станция «' + name + '» сейчас не отвечает');
+        },
+        state: function (st) {
+            if (!this.bar) return;
+            clearTimeout(st === 'live' ? this.timer : null);
+            var t = { load: 'Подключаюсь…', live: 'В эфире · OK на станции — пауза', pause: 'Пауза · OK на станции — продолжить' }[st] || '';
+            this.bar.find('.mtv-radio__state').text(t);
+            this.bar.toggleClass('mtv-radio--live', st === 'live');
+        },
+        render: function () {
+            if (!this.bar) return;
+            var st = this.station;
+            $('.mtv').toggleClass('mtv--radio', !!st);
+            if (!st) return;
+            this.bar.find('.mtv-radio__name').text(st.name);
+            this.bar.find('.mtv-radio__logo').html(st.logo ? '<img src="' + esc(st.logo) + '">' : '📻');
+            this.bar.find('.mtv-radio__logo img').on('error', function () { $(this).replaceWith('📻'); });
+        }
+    };
 
     // ---------- плеер ----------
 
@@ -363,9 +440,12 @@
         var bad = getJSON('mtv_bad', {});
         bad[c.key] = count; bad[c.key + '_t'] = Date.now();
         setJSON('mtv_bad', bad);
+        resetCache();
     }
 
     function play(c, list) {
+        if (c.radio) return RADIO_PLAYER.play(c);
+        RADIO_PLAYER.stop();
         Lampa.Loading.start(function () { Lampa.Loading.stop(); });
         pickUrl(c, function (url, idx) {
             Lampa.Loading.stop();
@@ -391,7 +471,9 @@
             '.mtv{display:flex;height:100%;box-sizing:border-box;padding:0 1.5em 0 1em}' +
             '.mtv-side{width:19em;flex-shrink:0;overflow:hidden;position:relative;padding:1em .5em 2em 0}' +
             '.mtv-main{flex:1;overflow:hidden;position:relative;padding:1em 0 2em 1.2em}' +
-            '.mtv-side__in,.mtv-main__in{position:relative;transition:transform .18s ease-out}' +
+            '.mtv-side__in{position:relative;transition:transform .15s ease-out}' +
+            '.mtv-main__in{position:relative}' +
+            '.mtv--radio .mtv-side,.mtv--radio .mtv-main{padding-bottom:6.5em}' +
             '.mtv-cat{display:flex;align-items:center;padding:.7em 1em;margin-bottom:.3em;border-radius:1em}' +
             '.mtv-cat__ico{width:1.8em;font-size:1.15em}' +
             '.mtv-cat__name{flex:1;font-size:1.08em}' +
@@ -426,9 +508,27 @@
             '.mtv-lock.focus{background:#fff;color:#111}' +
             '.mtv-empty{opacity:.5;padding:2em .3em;font-size:1.1em}' +
             '.mtv-foot{opacity:.35;font-size:.85em;padding:1em .3em}' +
-            '.mtv-prev{position:absolute;right:1.5em;bottom:1.5em;width:24em;height:13.5em;border-radius:1em;overflow:hidden;background:#000;box-shadow:0 1em 3em rgba(0,0,0,.6);z-index:5;display:none}' +
-            '.mtv-prev video{width:100%;height:100%;object-fit:cover}' +
-            '.mtv-prev__name{position:absolute;left:0;right:0;bottom:0;padding:.6em .9em;font-size:.85em;background:linear-gradient(transparent,rgba(0,0,0,.8))}';
+            '.mtv-aside{width:27em;flex-shrink:0;padding:1em 0 2em 1.5em;display:none}' +
+            '.mtv--prev .mtv-aside{display:block}' +
+            '.mtv-aside__video{width:100%;padding-top:56.25%;position:relative;border-radius:1em;overflow:hidden;background:rgba(255,255,255,.05)}' +
+            '.mtv-aside__video video{position:absolute;left:0;top:0;width:100%;height:100%;object-fit:cover}' +
+            '.mtv-aside__ph{position:absolute;left:0;top:0;right:0;bottom:0;display:flex;align-items:center;justify-content:center;opacity:.35;font-size:.95em}' +
+            '.mtv-aside__name{font-size:1.4em;font-weight:700;margin-top:.8em}' +
+            '.mtv-aside__epg{margin-top:.6em;opacity:.75;line-height:1.45}' +
+            '.mtv-radio{position:absolute;left:1em;right:1.5em;bottom:1em;height:5em;display:none;align-items:center;padding:0 1.2em;border-radius:1.2em;background:rgba(20,20,28,.92);box-shadow:0 .8em 2.5em rgba(0,0,0,.55);z-index:6}' +
+            '.mtv--radio .mtv-radio{display:flex}' +
+            '.mtv-radio__logo{width:3.4em;height:3.4em;border-radius:.8em;background:rgba(255,255,255,.08);display:flex;align-items:center;justify-content:center;overflow:hidden;font-size:1.5em;margin-right:1em}' +
+            '.mtv-radio__logo img{max-width:85%;max-height:85%;object-fit:contain}' +
+            '.mtv-radio__info{flex:1;min-width:0}' +
+            '.mtv-radio__name{font-size:1.2em;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}' +
+            '.mtv-radio__state{opacity:.55;font-size:.85em;margin-top:.2em}' +
+            '.mtv-eq{display:flex;align-items:flex-end;height:2.4em;margin-left:1em}' +
+            '.mtv-eq i{display:block;width:.42em;margin-left:.28em;height:20%;border-radius:.2em;background:linear-gradient(180deg,#2fb6ff,#7c5cff);animation:mtvEq 1s ease-in-out infinite alternate;animation-play-state:paused}' +
+            '.mtv-eq i:nth-child(2){animation-duration:.7s}.mtv-eq i:nth-child(3){animation-duration:1.2s}.mtv-eq i:nth-child(4){animation-duration:.55s}' +
+            '.mtv-eq i:nth-child(5){animation-duration:.9s}.mtv-eq i:nth-child(6){animation-duration:.65s}.mtv-eq i:nth-child(7){animation-duration:1.05s}' +
+            '.mtv-radio--live .mtv-eq i{animation-play-state:running}' +
+            '@keyframes mtvEq{0%{height:15%}50%{height:90%}100%{height:40%}}' +
+            '.mtv-row--playing{box-shadow:inset 0 0 0 2px #2fb6ff}';
         var st = document.createElement('style');
         st.id = 'mtv-style'; st.textContent = css;
         document.head.appendChild(st);
@@ -441,38 +541,72 @@
         var html = $('<div class="mtv"></div>');
         var side = $('<div class="mtv-side"><div class="mtv-side__in"></div></div>');
         var main = $('<div class="mtv-main"><div class="mtv-main__in"></div></div>');
-        var prev = $('<div class="mtv-prev"><video muted playsinline></video><div class="mtv-prev__name"></div></div>');
+        var prev = $('<div class="mtv-aside"><div class="mtv-aside__video"><div class="mtv-aside__ph">Превью</div><video muted playsinline></video></div>' +
+            '<div class="mtv-aside__name"></div><div class="mtv-aside__epg"></div></div>');
         var sideIn = side.find('.mtv-side__in'), mainIn = main.find('.mtv-main__in');
         var data = null, cats = [], current = null, currentCat = null, currentEl = null, lastRow = null, zone = 'side';
         var rows = [], rowRefs = [], curList = [], shown = 0;
-        var switchTimer = null, prevTimer = null, epgTimer = null;
+        var switchTimer = null, prevTimer = null, epgTimer = null, wheelAt = 0, mouseAt = 0;
 
         html.append(side).append(main).append(prev);
+        if (field('mtv_preview', false)) html.addClass('mtv--prev');
+
+        function setY(inner, y) { inner.data('y', y); inner.css('transform', 'translate3d(0,' + (-y) + 'px,0)'); }
+        function maxY(box, inner) { return Math.max(0, inner[0].scrollHeight - box[0].clientHeight + 40); }
 
         function follow(box, inner, el) {
+            // если двигают курсором Magic Remote, список не дёргаем
+            if (Date.now() - mouseAt < 400 || Date.now() - wheelAt < 400) return;
             var boxH = box[0].clientHeight, top = el[0].offsetTop, h = el[0].offsetHeight;
-            var innerH = inner[0].scrollHeight;
-            var y = Math.max(0, Math.min(top - boxH / 2 + h / 2, innerH - boxH + 40));
-            inner.css('transform', 'translate3d(0,' + (-y) + 'px,0)');
+            setY(inner, Math.max(0, Math.min(top - boxH / 2 + h / 2, maxY(box, inner))));
         }
+
+        // колесо пульта: свободная прокрутка колонки, над которой курсор
+        function wheel(box, inner, isMain) {
+            return function (e) {
+                e.preventDefault(); e.stopPropagation();
+                wheelAt = Date.now();
+                var d = e.deltaY || (e.wheelDelta ? -e.wheelDelta : 0) || (e.detail || 0);
+                if (!d) return;
+                var step = Math.max(80, box[0].clientHeight * 0.3);
+                var y = (inner.data('y') || 0) + (d > 0 ? step : -step);
+                if (isMain && d > 0 && shown < curList.length && y > maxY(box, inner) - box[0].clientHeight) {
+                    self.addRows();
+                    self.recollect();
+                }
+                setY(inner, Math.max(0, Math.min(y, maxY(box, inner))));
+            };
+        }
+        [[side, sideIn, false], [main, mainIn, true]].forEach(function (z) {
+            var fn = wheel(z[0], z[1], z[2]);
+            z[0][0].addEventListener('wheel', fn, { passive: false });
+            z[0][0].addEventListener('mousewheel', fn, { passive: false });
+        });
+        html[0].addEventListener('mousemove', function () { mouseAt = Date.now(); });
+        RADIO_PLAYER.mount(html);
 
         // ---- превью ----
         function hidePreview() {
             clearTimeout(prevTimer);
             var v = prev.find('video')[0];
             if (v && v.getAttribute('src')) { try { v.pause(); } catch (e) {} v.removeAttribute('src'); try { v.load(); } catch (e) {} }
-            prev.hide();
+            prev.find('.mtv-aside__ph').show();
         }
+        // справа отдельная колонка: название и программа сразу, видео через 1,5 с, когда перестали листать
         function schedulePreview(ch) {
-            clearTimeout(prevTimer);
-            if (!field('mtv_preview', false) || ch.radio) { hidePreview(); return; }
+            if (!html.hasClass('mtv--prev')) return;
+            hidePreview();
+            prev.find('.mtv-aside__name').text(ch.name);
+            var nn = nowNext(ch);
+            prev.find('.mtv-aside__epg').html(ch.radio ? esc(ch.tags || '') :
+                nn ? '<b>Сейчас:</b> ' + hhmm(nn.now[0]) + ' ' + esc(nn.now[2]) + (nn.next ? '<br><b>Далее:</b> ' + hhmm(nn.next[0]) + ' ' + esc(nn.next[2]) : '') : '');
+            if (ch.radio) return;
             prevTimer = setTimeout(function () {
                 var v = prev.find('video')[0];
-                prev.find('.mtv-prev__name').text(ch.name);
                 v.src = ch.urls[0];
-                prev.show();
+                prev.find('.mtv-aside__ph').hide();
                 try { var p = v.play(); if (p && p.catch) p.catch(function () {}); } catch (e) {}
-            }, 1200);
+            }, 1500);
         }
 
         // ---- телепрограмма ----
@@ -512,14 +646,18 @@
             if (id === 'recent') return getJSON('mtv_recent2', []);
             if (id === 'search') return this.searchList(STATE.query);
             if (id.indexOf('r_') === 0) return radioList(id);
-            var vis = visible(data.list);
-            return sortList(id === 'all' ? vis.filter(function (c) { return !c.world; }) : vis.filter(function (c) { return c.cat === id; }));
+            if (STATE.cats[id]) return STATE.cats[id];
+            if (!STATE.vis) STATE.vis = visible(data.list);
+            var vis = STATE.vis;
+            STATE.cats[id] = sortList(id === 'all' ? vis.filter(function (c) { return !c.world; }) : vis.filter(function (c) { return c.cat === id; }));
+            return STATE.cats[id];
         };
 
         this.searchList = function (q) {
             q = String(q || '').toLowerCase().trim();
             if (!q) return [];
-            var res = visible(data.list).filter(function (c) {
+            if (!STATE.vis) STATE.vis = visible(data.list);
+            var res = STATE.vis.filter(function (c) {
                 if (c.cat === 'adult') return false;
                 if (c.name.toLowerCase().indexOf(q) !== -1) return true;
                 var nn = nowNext(c);
@@ -567,7 +705,7 @@
                     follow(side, sideIn, el);
                     clearTimeout(switchTimer);
                     if (c.id === 'search') return;
-                    switchTimer = setTimeout(function () { self.showCat(c, el); }, 220);
+                    switchTimer = setTimeout(function () { self.showCat(c, el); }, 350);
                 });
                 el.on('hover:enter', function () {
                     clearTimeout(switchTimer);
@@ -621,7 +759,8 @@
             if (c.id !== 'search') Lampa.Storage.set('mtv_last_cat', c.id);
             if (c.world) loadEpg('w', refreshEpg);
 
-            mainIn.empty().css('transform', 'translate3d(0,0,0)');
+            mainIn.empty();
+            setY(mainIn, 0);
             rows = []; rowRefs = []; lastRow = null;
 
             if (c.id === 'adult' && !STATE.unlocked) {
@@ -665,6 +804,8 @@
 
         this.addRows = function () {
             var list = curList, end = Math.min(shown + PAGE, list.length);
+            var favs = {};
+            getJSON('mtv_fav2', []).forEach(function (f) { favs[f.key] = 1; });
             list.slice(shown, end).forEach(function (ch, j) {
                 var index = shown + j;
                 var letter = esc((ch.name || '?').charAt(0).toUpperCase());
@@ -672,7 +813,7 @@
                     '<div class="mtv-row__logo">' + (ch.logo ? '<img src="' + esc(ch.logo) + '">' : '<div class="mtv-row__letter">' + letter + '</div>') + '</div>' +
                     '<div class="mtv-row__info"><div class="mtv-row__name">' + esc(ch.name) + '</div><div class="mtv-row__box"></div></div>' +
                     '<div class="mtv-row__tags">' +
-                    (isFav(ch) ? '<span>⭐</span>' : '') +
+                    (favs[ch.key] ? '<span>⭐</span>' : '') +
                     (ch.urls && ch.urls.length > 1 ? '<div class="mtv-tag">' + ch.urls.length + ' зерк.</div>' : '') +
                     (ch.hd ? '<div class="mtv-tag mtv-tag--hd">HD</div>' : '') +
                     (ch.radio ? '' : '<div class="mtv-dot' + (ch.status === 'geo' ? ' mtv-dot--geo' : ch.status === 'user' ? ' mtv-dot--user' : '') + '"></div>') +
@@ -690,7 +831,12 @@
                         Lampa.Controller.collectionFocus(row[0], html);
                     }
                 });
-                row.on('hover:enter', function () { hidePreview(); play(ch, list); });
+                if (RADIO_PLAYER.station && RADIO_PLAYER.station.key === ch.key) row.addClass('mtv-row--playing');
+                row.on('hover:enter', function () {
+                    hidePreview();
+                    play(ch, list);
+                    if (ch.radio) { mainIn.find('.mtv-row--playing').removeClass('mtv-row--playing'); if (RADIO_PLAYER.station) row.addClass('mtv-row--playing'); }
+                });
                 row.on('hover:long', function () { hidePreview(); self.menu(ch); });
                 rows.push(row[0]);
                 mainIn.append(row);
@@ -746,10 +892,11 @@
                 },
                 right: function () { if (zone === 'side') self.focusList(); },
                 up: function () {
+                    if (Date.now() - wheelAt < 250) return;
                     if (Navigator.canmove('up')) Navigator.move('up');
                     else Lampa.Controller.toggle('head');
                 },
-                down: function () { if (Navigator.canmove('down')) Navigator.move('down'); },
+                down: function () { if (Date.now() - wheelAt < 250) return; if (Navigator.canmove('down')) Navigator.move('down'); },
                 back: function () {
                     if (zone === 'main') self.focusSide();
                     else Lampa.Activity.backward();
@@ -763,6 +910,7 @@
         this.render = function () { return html; };
         this.destroy = function () {
             clearTimeout(switchTimer); clearInterval(epgTimer); hidePreview();
+            RADIO_PLAYER.stop();
             html.remove();
         };
     }
@@ -793,7 +941,7 @@
                 component: PLUGIN,
                 param: { name: t[0], type: 'trigger', default: t[2] },
                 field: { name: t[1], description: t[3] },
-                onChange: function () { STATE.data = null; }
+                onChange: function () { STATE.data = null; resetCache(); }
             });
         });
         Lampa.SettingsApi.addParam({
@@ -816,7 +964,7 @@
             param: { name: 'mtv_reset_hidden', type: 'button' },
             field: { name: 'Вернуть скрытые каналы' },
             onChange: function () {
-                setJSON('mtv_hidden', []); setJSON('mtv_bad', {});
+                setJSON('mtv_hidden', []); setJSON('mtv_bad', {}); resetCache();
                 noty('Скрытые каналы возвращены');
             }
         });

@@ -25,6 +25,50 @@ const CATS = [
   { id: 'r_classic', words: ['classical', 'classic music', 'классик', 'opera', 'orchestra', 'baroque', 'symphon'] },
   { id: 'r_talk', words: ['news', 'talk', 'новост', 'разговор', 'спорт', 'sport', 'information'] },
 ];
+// Проверка станции: отвечает 200 и реально отдаёт аудио (или HLS-плейлист)
+async function probe(url) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 9000);
+  try {
+    const r = await fetch(url, { headers: { ...UA, 'Icy-MetaData': '0' }, redirect: 'follow', signal: ctrl.signal });
+    if (!r.ok) return false;
+    const type = (r.headers.get('content-type') || '').toLowerCase();
+    const reader = r.body && r.body.getReader();
+    let bytes = 0, text = '';
+    if (reader) {
+      const start = Date.now();
+      while (bytes < 8192 && Date.now() - start < 6000) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        bytes += value.length;
+        if (text.length < 200) text += Buffer.from(value).toString('latin1');
+      }
+      reader.cancel().catch(() => {});
+    }
+    if (/mpegurl/.test(type) || text.startsWith('#EXTM3U')) return text.includes('#EXT');
+    if (/text\/html/.test(type)) return false;
+    return bytes >= 2048 && /audio|mpeg|ogg|aac|octet|application\/x-|video\/mp2t/.test(type || 'audio');
+  } catch (e) {
+    return false;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+const hostBusy = new Map();
+async function checkAll(list, n) {
+  let i = 0;
+  const host = (u) => { try { return new URL(u).host; } catch { return u; } };
+  await Promise.all(Array.from({ length: n }, async () => {
+    while (i < list.length) {
+      const s = list[i++], h = host(s.url_resolved || s.url);
+      while ((hostBusy.get(h) || 0) >= 4) await new Promise((r) => setTimeout(r, 50));
+      hostBusy.set(h, (hostBusy.get(h) || 0) + 1);
+      try { s.alive = await probe(s.url_resolved || s.url); } finally { hostBusy.set(h, hostBusy.get(h) - 1); }
+    }
+  }));
+}
+
 const OK_CODEC = /^(mp3|aac|aac\+|he-aac|mpeg|ogg|unknown)$/i;
 
 function slim(s) {
@@ -38,7 +82,17 @@ async function main() {
 
   const seen = new Set();
   const ruList = ru.filter(good).filter((s) => !seen.has(s.stationuuid) && seen.add(s.stationuuid));
-  const wList = world.filter(good).filter((s) => !seen.has(s.stationuuid) && seen.add(s.stationuuid));
+  const wList0 = world.filter(good).filter((s) => !seen.has(s.stationuuid) && seen.add(s.stationuuid));
+  const ruList0 = ruList.splice(0);
+
+  await checkAll([...ruList0, ...wList0], 48);
+  // страховка: если проверка сломалась и «живых» подозрительно мало, оставляем список как есть
+  const aliveShare = [...ruList0, ...wList0].filter((s) => s.alive).length / Math.max(1, ruList0.length + wList0.length);
+  const trust = aliveShare > 0.25;
+  if (!trust) console.log('alive share too low, keeping unchecked list', aliveShare);
+  ruList.push(...ruList0.filter((s) => !trust || s.alive));
+  const wList = wList0.filter((s) => !trust || s.alive);
+  console.log('radio alive: ru', ruList.length, 'of', ruList0.length, '| world', wList.length, 'of', wList0.length);
 
   const cats = { r_ru: ruList.slice(0, 200).map(slim) };
   for (const c of CATS) {
